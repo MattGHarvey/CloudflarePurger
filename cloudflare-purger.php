@@ -77,6 +77,11 @@ class CloudflarePurger {
         add_action('wp_ajax_cloudflare_purge_all', array($this, 'ajax_purge_all'));
         add_action('wp_ajax_cloudflare_test_connection', array($this, 'ajax_test_connection'));
         add_action('wp_ajax_cloudflare_purge_post', array($this, 'ajax_purge_post'));
+        add_action('wp_ajax_cloudflare_purge_media', array($this, 'ajax_purge_media'));
+        
+        // Edit Media screen hooks
+        add_action('add_meta_boxes_attachment', array($this, 'add_attachment_meta_box'));
+        add_action('admin_enqueue_scripts', array($this, 'enqueue_attachment_scripts'));
         
         // Post save hooks for automatic purging
         add_action('save_post', array($this, 'on_post_save'), 20);
@@ -263,7 +268,7 @@ class CloudflarePurger {
      * Enqueue admin scripts and styles
      */
     public function admin_enqueue_scripts($hook) {
-        if (strpos($hook, 'cloudflare') !== false) {
+        if (strpos($hook, 'cloudflare') !== false || $hook === 'upload.php' || $hook === 'post.php') {
             wp_enqueue_script(
                 'cloudflare-purger-admin',
                 CLOUDFLARE_PURGER_PLUGIN_URL . 'assets/admin.js',
@@ -666,6 +671,212 @@ class CloudflarePurger {
         } else {
             wp_send_json_error('Failed to purge post images. Check the log for details.');
         }
+    }
+    
+    /**
+     * AJAX handler for purging media files from Cloudflare cache
+     */
+    public function ajax_purge_media() {
+        // Security checks
+        if (!current_user_can('upload_files')) {
+            wp_send_json_error('Insufficient permissions');
+        }
+        
+        if (!wp_verify_nonce($_POST['nonce'] ?? '', 'cloudflare_purger_nonce')) {
+            wp_send_json_error('Invalid nonce');
+        }
+        
+        $attachment_id = intval($_POST['attachment_id'] ?? 0);
+        if (!$attachment_id || !wp_attachment_is_image($attachment_id)) {
+            wp_send_json_error('Invalid attachment ID or not an image');
+        }
+        
+        $result = $this->purge_media_cache($attachment_id);
+        
+        if ($result) {
+            wp_send_json_success('Successfully purged cache for media file');
+        } else {
+            wp_send_json_error('Failed to purge media cache. Check the log for details.');
+        }
+    }
+    
+    /**
+     * Add Cloudflare Cache meta box to attachment edit screen
+     */
+    public function add_attachment_meta_box() {
+        global $post;
+        
+        // Only add for images and if user has upload permissions
+        if (wp_attachment_is_image($post->ID) && current_user_can('upload_files')) {
+            add_meta_box(
+                'cloudflare-cache-purge',
+                '<span class="dashicons dashicons-cloud" style="margin-right: 8px; color: #0073aa;"></span>' . __('Cloudflare Cache', 'cloudflare-purger'),
+                array($this, 'render_attachment_meta_box'),
+                'attachment',
+                'side',
+                'high'
+            );
+        }
+    }
+
+    /**
+     * Render the Cloudflare Cache meta box content
+     */
+    public function render_attachment_meta_box($post) {
+        ?>
+        <div class="cloudflare-meta-box-content">
+            <?php if ($this->is_configured()) : ?>
+                <p class="cloudflare-description">
+                    <?php _e('Purge this image and all its size variants from Cloudflare cache.', 'cloudflare-purger'); ?>
+                </p>
+                
+                <p class="cloudflare-button-container">
+                    <button type="button" class="button button-primary cloudflare-purge-attachment" data-attachment-id="<?php echo esc_attr($post->ID); ?>">
+                        <span class="dashicons dashicons-update" style="font-size: 16px; line-height: 1.2; margin-right: 5px;"></span>
+                        <?php _e('Purge Cache', 'cloudflare-purger'); ?>
+                    </button>
+                </p>
+                
+                <div id="cloudflare-purge-result" class="cloudflare-result-message"></div>
+                
+                <div class="cloudflare-info">
+                    <p class="description">
+                        <?php 
+                        $image_sizes = $this->get_image_size_info($post->ID);
+                        printf(
+                            __('This will purge %d image variant(s) from cache.', 'cloudflare-purger'),
+                            count($image_sizes)
+                        );
+                        ?>
+                    </p>
+                </div>
+                
+            <?php else : ?>
+                <div class="cloudflare-not-configured">
+                    <p>
+                        <span class="dashicons dashicons-warning" style="color: #d63638; margin-right: 5px;"></span>
+                        <?php _e('Cloudflare Purger is not configured.', 'cloudflare-purger'); ?>
+                    </p>
+                    <p>
+                        <a href="<?php echo esc_url(admin_url('options-general.php?page=cloudflare-purger')); ?>" class="button">
+                            <?php _e('Configure Plugin', 'cloudflare-purger'); ?>
+                        </a>
+                    </p>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
+    /**
+     * Get information about image sizes for display
+     */
+    private function get_image_size_info($attachment_id) {
+        $urls = $this->get_image_urls($attachment_id);
+        return $urls;
+    }
+
+    /**
+     * Enqueue scripts specifically for attachment editing
+     */
+    public function enqueue_attachment_scripts() {
+        global $pagenow, $typenow;
+        
+        // Only enqueue on post.php when editing attachments
+        if ($pagenow === 'post.php' && $typenow === 'attachment') {
+            // Scripts are already enqueued by admin_enqueue_scripts, just add inline script
+            add_action('admin_footer', array($this, 'add_attachment_edit_scripts'));
+        }
+    }
+
+    /**
+     * Add JavaScript for attachment edit screen
+     */
+    public function add_attachment_edit_scripts() {
+        ?>
+        <script type="text/javascript">
+        jQuery(document).ready(function($) {
+            // Initialize attachment purge functionality
+            if (typeof window.cloudflareAttachmentPurge === 'undefined') {
+                window.cloudflareAttachmentPurge = true;
+                
+                // Handle attachment purge button clicks
+                $(document).on('click', '.cloudflare-purge-attachment', function(e) {
+                    e.preventDefault();
+                    
+                    var button = $(this);
+                    var attachmentId = button.data('attachment-id');
+                    var resultDiv = $('#cloudflare-purge-result');
+                    var originalHtml = button.html();
+                    var originalText = button.find('span:not(.dashicons)').text() || button.text().trim();
+                    
+                    // Prevent multiple clicks
+                    if (button.hasClass('purging')) {
+                        return;
+                    }
+                    
+                    // Update button state
+                    button.addClass('purging').prop('disabled', true);
+                    button.html('<span class="dashicons dashicons-update"></span> Purging...');
+                    
+                    // Show processing message
+                    resultDiv.removeClass('success error').html('<p>Processing purge request...</p>');
+                    
+                    $.ajax({
+                        url: cloudflare_purger_ajax.ajax_url,
+                        type: 'POST',
+                        data: {
+                            action: 'cloudflare_purge_media',
+                            attachment_id: attachmentId,
+                            nonce: cloudflare_purger_ajax.nonce
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                resultDiv.addClass('success').html('<p>✓ ' + response.data + '</p>');
+                                
+                                // Temporarily show success state
+                                button.html('<span class="dashicons dashicons-yes"></span> Purged!');
+                                setTimeout(function() {
+                                    button.html(originalHtml);
+                                }, 2000);
+                            } else {
+                                resultDiv.addClass('error').html('<p>✗ ' + (response.data || 'Failed to purge cache') + '</p>');
+                            }
+                        },
+                        error: function() {
+                            resultDiv.addClass('error').html('<p>✗ Network error occurred while purging cache</p>');
+                        },
+                        complete: function() {
+                            setTimeout(function() {
+                                button.removeClass('purging').prop('disabled', false);
+                                if (!button.html().includes('dashicons-yes')) {
+                                    button.html(originalHtml);
+                                }
+                            }, response && response.success ? 2000 : 100);
+                        }
+                    });
+                });
+            }
+        });
+        </script>
+        <?php
+    }    /**
+     * Purge cache for a specific media file and all its variants
+     */
+    public function purge_media_cache($attachment_id) {
+        if (!$this->is_configured()) {
+            $this->log_operation('media_purge', [], $attachment_id, 'error', 'Plugin not configured');
+            return false;
+        }
+        
+        $urls_to_purge = $this->get_image_urls($attachment_id);
+        
+        if (empty($urls_to_purge)) {
+            $this->log_operation('media_purge', [], $attachment_id, 'info', 'No URLs found to purge');
+            return false;
+        }
+        
+        return $this->purge_cloudflare_cache($urls_to_purge, 'media_purge', $attachment_id);
     }
     
     /**

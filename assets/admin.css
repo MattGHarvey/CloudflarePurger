@@ -214,3 +214,129 @@ button:disabled,
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
 }
+
+/* Cloudflare Cache Meta Box Styling */
+#cloudflare-cache-purge .inside {
+    padding: 12px;
+}
+
+.cloudflare-meta-box-content {
+    text-align: left;
+}
+
+.cloudflare-description {
+    margin: 0 0 12px 0;
+    color: #646970;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.cloudflare-button-container {
+    margin: 0 0 15px 0;
+    text-align: center;
+}
+
+.cloudflare-purge-attachment {
+    width: 100%;
+    padding: 8px 12px;
+    font-size: 13px;
+    line-height: 1.4;
+    text-align: center;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.cloudflare-purge-attachment .dashicons {
+    margin-right: 5px;
+    font-size: 16px;
+    line-height: 1.2;
+}
+
+.cloudflare-purge-attachment:disabled,
+.cloudflare-purge-attachment.purging {
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+.cloudflare-purge-attachment.purging .dashicons {
+    animation: spin 1s linear infinite;
+}
+
+/* Result message styling for meta box */
+.cloudflare-result-message {
+    margin: 0 0 12px 0;
+    min-height: 0;
+    transition: all 0.3s ease;
+}
+
+.cloudflare-result-message:empty {
+    margin: 0;
+}
+
+.cloudflare-result-message p {
+    margin: 0;
+    padding: 8px 10px;
+    border-radius: 3px;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.cloudflare-result-message.success p {
+    background-color: #d4edda;
+    border: 1px solid #c3e6cb;
+    color: #155724;
+}
+
+.cloudflare-result-message.error p {
+    background-color: #f8d7da;
+    border: 1px solid #f5c6cb;
+    color: #721c24;
+}
+
+/* Info section styling */
+.cloudflare-info {
+    padding-top: 8px;
+    border-top: 1px solid #dcdcde;
+}
+
+.cloudflare-info .description {
+    margin: 0;
+    font-size: 12px;
+    color: #646970;
+    font-style: italic;
+}
+
+/* Not configured state styling */
+.cloudflare-not-configured {
+    text-align: center;
+    padding: 10px 0;
+}
+
+.cloudflare-not-configured p {
+    margin: 0 0 10px 0;
+    font-size: 13px;
+}
+
+.cloudflare-not-configured .dashicons {
+    vertical-align: text-top;
+}
+
+.cloudflare-not-configured .button {
+    width: 100%;
+    text-align: center;
+}
+
+/* Meta box title styling */
+#cloudflare-cache-purge .hndle {
+    display: flex;
+    align-items: center;
+}
+
+#cloudflare-cache-purge .hndle::before {
+    content: "\f176";
+    font-family: dashicons;
+    margin-right: 8px;
+    color: #0073aa;
+}
