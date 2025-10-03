@@ -3,7 +3,7 @@
  * Plugin Name: Cloudflare Purger
  * Plugin URI: https://github.com/MattGHarvey/CloudflarePurger
  * Description: Automatically purge Cloudflare cache when WordPress posts are saved, including all attached images and their size variants. Includes admin interface for manual cache management.
- * Version: 1.0.0
+ * Version: 1.2.0
  * Author: Matt Harvey
  * Author URI: https://robotsprocket.com
  * License: GPL v2 or later
@@ -42,6 +42,11 @@ class CloudflarePurger {
     private $options;
     
     /**
+     * Debug notices
+     */
+    private $debug_notices = array();
+    
+    /**
      * Get plugin instance
      */
     public static function get_instance() {
@@ -78,6 +83,7 @@ class CloudflarePurger {
         add_action('wp_ajax_cloudflare_test_connection', array($this, 'ajax_test_connection'));
         add_action('wp_ajax_cloudflare_purge_post', array($this, 'ajax_purge_post'));
         add_action('wp_ajax_cloudflare_purge_media', array($this, 'ajax_purge_media'));
+
         
         // Edit Media screen hooks
         add_action('add_meta_boxes_attachment', array($this, 'add_attachment_meta_box'));
@@ -86,9 +92,26 @@ class CloudflarePurger {
         // Post save hooks for automatic purging
         add_action('save_post', array($this, 'on_post_save'), 20);
         add_action('cloudflare_purge_post_images', array($this, 'purge_post_images'), 10, 1);
+        add_action('cloudflare_purge_media_delayed', array($this, 'purge_media_cache_delayed'), 10, 1);
+        
+        // Media replacement hooks for automatic purging
+        add_action('emr_replaced_attachment', array($this, 'on_media_replaced'), 10, 2); // Enable Media Replace
+        add_action('wp_media_replace_uploaded', array($this, 'on_media_replaced_wp_media_replace'), 10, 1); // WP Media Replace
+        add_action('replace_attachment', array($this, 'on_media_replaced_simple'), 10, 1); // Media Replace
+        add_action('easy_media_replace_after', array($this, 'on_media_replaced_simple'), 10, 1); // Easy Media Replace
+        add_action('attachment_updated', array($this, 'on_attachment_updated'), 10, 3); // Generic WordPress hook
+        
+        // Enable Media Replace hooks (keep the working ones)
+        add_action('emr_replaced_attachment', array($this, 'on_media_replaced'), 10, 2); 
+        add_action('emr_attachment_replaced', array($this, 'on_emr_attachment_replaced'), 10, 2);
+        
+        // WordPress core hooks that are working
+        add_action('wp_update_attachment_metadata', array($this, 'on_attachment_metadata_updated'), 10, 2);
+        add_action('updated_post_meta', array($this, 'on_post_meta_updated'), 10, 4);
         
         // Add admin notices
         add_action('admin_notices', array($this, 'admin_notices'));
+        add_action('admin_notices', array($this, 'show_debug_notices'));
     }
     
     /**
@@ -102,6 +125,7 @@ class CloudflarePurger {
             'auto_purge_on_save' => true,
             'purge_attached_images' => true,
             'purge_content_images' => true,
+            'auto_purge_on_media_replace' => true,
             'log_operations' => true,
             'async_purging' => true,
         );
@@ -248,6 +272,14 @@ class CloudflarePurger {
         );
         
         add_settings_field(
+            'auto_purge_on_media_replace',
+            'Auto-purge on Media Replace',
+            array($this, 'auto_purge_media_replace_field_callback'),
+            'cloudflare-purger',
+            'auto_purge_settings'
+        );
+        
+        add_settings_field(
             'async_purging',
             'Asynchronous Purging',
             array($this, 'async_purging_field_callback'),
@@ -315,6 +347,245 @@ class CloudflarePurger {
             wp_schedule_single_event(time() + 2, 'cloudflare_purge_post_images', array($post_id));
         } else {
             $this->purge_post_images($post_id);
+        }
+    }
+    
+    /**
+     * Handle media replacement from Enable Media Replace plugin
+     */
+    public function on_media_replaced($old_attachment_id, $new_attachment_id) {
+        // Check if auto-purge on media replace is enabled
+        if (!$this->get_option('auto_purge_on_media_replace', true)) {
+            return;
+        }
+        
+        if (!$this->is_configured()) {
+            return;
+        }
+        
+        // Purge both old and new attachment URLs to be safe
+        $this->purge_media_cache($old_attachment_id);
+        if ($new_attachment_id && $new_attachment_id !== $old_attachment_id) {
+            $this->purge_media_cache($new_attachment_id);
+        }
+        
+        $this->log_operation('media_replace', [], $old_attachment_id, 'success', 'Media replacement detected and cache purged');
+    }
+    
+    /**
+     * Handle media replacement from WP Media Replace plugin
+     */
+    public function on_media_replaced_wp_media_replace($data) {
+        // Check if auto-purge on media replace is enabled
+        if (!$this->get_option('auto_purge_on_media_replace', true)) {
+            return;
+        }
+        
+        if (!$this->is_configured()) {
+            return;
+        }
+        
+        $attachment_id = isset($data['attachment_id']) ? $data['attachment_id'] : null;
+        if (!$attachment_id) {
+            return;
+        }
+        
+        $this->purge_media_cache($attachment_id);
+        $this->log_operation('media_replace', [], $attachment_id, 'success', 'WP Media Replace detected and cache purged');
+    }
+    
+    /**
+     * Handle media replacement from simple replacement plugins
+     */
+    public function on_media_replaced_simple($attachment_id) {
+        // Check if auto-purge on media replace is enabled
+        if (!$this->get_option('auto_purge_on_media_replace', true)) {
+            return;
+        }
+        
+        if (!$this->is_configured()) {
+            return;
+        }
+        
+        if (!wp_attachment_is_image($attachment_id)) {
+            return;
+        }
+        
+        $this->purge_media_cache($attachment_id);
+        $this->log_operation('media_replace', [], $attachment_id, 'success', 'Media replacement detected and cache purged');
+    }
+    
+    /**
+     * Handle generic attachment updates
+     */
+    public function on_attachment_updated($attachment_id, $attachment_after, $attachment_before) {
+        // Check if auto-purge on media replace is enabled
+        if (!$this->get_option('auto_purge_on_media_replace', true)) {
+            return;
+        }
+        
+        if (!$this->is_configured()) {
+            return;
+        }
+        
+        // Only process if it's an image
+        if (!wp_attachment_is_image($attachment_id)) {
+            return;
+        }
+        
+        // Check if the file has actually changed (avoid purging on metadata updates)
+        $old_file = get_attached_file($attachment_id, true);
+        $old_url = wp_get_attachment_url($attachment_id);
+        
+        // Only purge if this seems like a file replacement (not just metadata update)
+        if ($attachment_after && $attachment_before) {
+            $guid_changed = $attachment_after->guid !== $attachment_before->guid;
+            $modified_changed = $attachment_after->post_modified !== $attachment_before->post_modified;
+            
+            if ($guid_changed || $modified_changed) {
+                $this->purge_media_cache($attachment_id);
+                $this->log_operation('media_replace', [], $attachment_id, 'success', 'Attachment update detected and cache purged');
+            }
+        }
+    }
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    /**
+     * Handle Enable Media Replace attachment replaced hook
+     */
+    public function on_emr_attachment_replaced($old_attachment_id, $new_attachment_id) {
+
+        
+        if ($this->get_option('auto_purge_on_media_replace', true) && $this->is_configured()) {
+            $this->purge_media_cache($old_attachment_id);
+            if ($new_attachment_id && $new_attachment_id !== $old_attachment_id) {
+                $this->purge_media_cache($new_attachment_id);
+            }
+            $this->log_operation('media_replace', [], $old_attachment_id, 'success', 'EMR attachment replaced detected and cache purged');
+        }
+    }
+    
+
+    
+    /**
+     * Handle attachment metadata updates (often happens during media replacement)
+     */
+    public function on_attachment_metadata_updated($data, $attachment_id) {
+        if (!wp_attachment_is_image($attachment_id)) {
+            return $data;
+        }
+        
+        error_log("CloudflarePurger DEBUG: wp_update_attachment_metadata fired - Attachment ID: $attachment_id");
+        
+        // Check if this is likely a media replacement (new file size or dimensions)
+        $old_metadata = wp_get_attachment_metadata($attachment_id);
+        
+        if ($this->get_option('auto_purge_on_media_replace', true) && $this->is_configured()) {
+            // Look for signs this is a replacement, not just a metadata update
+            $is_replacement = false;
+            
+            if ($old_metadata && $data) {
+                // Check if file size changed significantly
+                if (isset($data['filesize']) && isset($old_metadata['filesize'])) {
+                    $size_diff = abs($data['filesize'] - $old_metadata['filesize']);
+                    if ($size_diff > 1000) { // More than 1KB difference
+                        $is_replacement = true;
+                    }
+                }
+                
+                // Check if dimensions changed
+                if (isset($data['width'], $data['height'], $old_metadata['width'], $old_metadata['height'])) {
+                    if ($data['width'] !== $old_metadata['width'] || $data['height'] !== $old_metadata['height']) {
+                        $is_replacement = true;
+                    }
+                }
+                
+                // Check if filename changed
+                if (isset($data['file']) && isset($old_metadata['file']) && $data['file'] !== $old_metadata['file']) {
+                    $is_replacement = true;
+                }
+            }
+            
+            if ($is_replacement) {
+
+                
+                // Schedule delayed purge to allow WordPress to finish processing
+                wp_schedule_single_event(time() + 3, 'cloudflare_purge_media_delayed', array($attachment_id));
+                
+                // Try immediate purge but don't log failure if no URLs (timing issue)
+                $urls_to_purge = $this->get_image_urls($attachment_id);
+                if (!empty($urls_to_purge)) {
+                    $result = $this->purge_cloudflare_cache($urls_to_purge, 'media_replace_immediate', $attachment_id);
+                } else {
+                    $this->log_operation('media_replace_immediate', [], $attachment_id, 'info', 'Media replacement detected, delayed purge scheduled (no URLs available yet)');
+                }
+            }
+        }
+        
+        return $data;
+    }
+    
+    /**
+     * Handle post meta updates (catch file path changes)
+     */
+    public function on_post_meta_updated($meta_id, $post_id, $meta_key, $meta_value) {
+        if ($meta_key !== '_wp_attached_file') {
+            return;
+        }
+        
+        if (!wp_attachment_is_image($post_id)) {
+            return;
+        }
+        
+        error_log("CloudflarePurger DEBUG: _wp_attached_file meta updated for Attachment ID: $post_id, New file: $meta_value");
+        
+        if ($this->get_option('auto_purge_on_media_replace', true) && $this->is_configured()) {
+            $this->purge_media_cache($post_id);
+            $this->log_operation('media_replace', [], $post_id, 'success', 'File path change detected and cache purged');
+        }
+    }
+    
+
+    
+
+    
+    /**
+     * Add a success notice to be displayed in admin
+     */
+    private function add_success_notice($message) {
+        $this->debug_notices[] = $message;
+        
+        // Also store in transient for display after redirect
+        $existing = get_transient('cloudflare_purger_success_notices') ?: array();
+        $existing[] = $message;
+        set_transient('cloudflare_purger_success_notices', $existing, 60);
+    }
+    
+    /**
+     * Display success notices in admin
+     */
+    public function show_debug_notices() {
+        // Show success notices from transient (after redirects)
+        $notices = get_transient('cloudflare_purger_success_notices');
+        if ($notices) {
+            foreach ($notices as $notice) {
+                echo '<div class="notice notice-success is-dismissible"><p><strong>Cloudflare Purger:</strong> ' . esc_html($notice) . '</p></div>';
+            }
+            delete_transient('cloudflare_purger_success_notices');
+        }
+        
+        // Also show any notices from current request
+        foreach ($this->debug_notices as $notice) {
+            echo '<div class="notice notice-success is-dismissible"><p><strong>Cloudflare Purger:</strong> ' . esc_html($notice) . '</p></div>';
         }
     }
     
@@ -452,6 +723,7 @@ class CloudflarePurger {
             'auto_purge_on_save',
             'purge_attached_images', 
             'purge_content_images',
+            'auto_purge_on_media_replace',
             'log_operations',
             'async_purging'
         ];
@@ -554,6 +826,13 @@ class CloudflarePurger {
         echo '<p class="description">Prevents page load delays by processing purge requests in the background</p>';
     }
     
+    public function auto_purge_media_replace_field_callback() {
+        $checked = $this->get_option('auto_purge_on_media_replace', true);
+        echo '<label><input type="checkbox" name="cloudflare_purger_options[auto_purge_on_media_replace]" value="1" ' . checked($checked, true, false) . ' />';
+        echo ' Automatically purge cache when media files are replaced</label>';
+        echo '<p class="description">Works with Enable Media Replace, WP Media Replace, and other media replacement plugins</p>';
+    }
+
     public function log_operations_field_callback() {
         $checked = $this->get_option('log_operations', true);
         echo '<label><input type="checkbox" name="cloudflare_purger_options[log_operations]" value="1" ' . checked($checked, true, false) . ' />';
@@ -749,6 +1028,16 @@ class CloudflarePurger {
                         );
                         ?>
                     </p>
+                    
+                    <?php if ($this->get_option('auto_purge_on_media_replace', true)) : ?>
+                        <p class="description" style="margin-top: 8px; color: #46b450;">
+                            <span class="dashicons dashicons-yes-alt" style="font-size: 14px; margin-right: 3px;"></span>
+                            <?php _e('Auto-purge is enabled for media replacement (with delayed fallback).', 'cloudflare-purger'); ?>
+                        </p>
+                        <p class="description" style="font-size: 11px; color: #666; margin-top: 4px;">
+                            <?php _e('Cache is purged immediately when possible, with a 3-second delayed backup to ensure all image variants are cleared.', 'cloudflare-purger'); ?>
+                        </p>
+                    <?php endif; ?>
                 </div>
                 
             <?php else : ?>
@@ -876,7 +1165,47 @@ class CloudflarePurger {
             return false;
         }
         
-        return $this->purge_cloudflare_cache($urls_to_purge, 'media_purge', $attachment_id);
+        $result = $this->purge_cloudflare_cache($urls_to_purge, 'media_purge', $attachment_id);
+        
+        // Show success message only if purge was successful
+        if ($result) {
+            $this->add_success_notice(sprintf(
+                __('Successfully purged %d image variant(s) from Cloudflare cache.', 'cloudflare-purger'),
+                count($urls_to_purge)
+            ));
+        }
+        
+        return $result;
+    }
+    
+    /**
+     * Handle delayed media cache purging
+     */
+    public function purge_media_cache_delayed($attachment_id) {
+        if (!$this->is_configured()) {
+            $this->log_operation('media_replace_delayed', [], $attachment_id, 'error', 'Plugin not configured for delayed purge');
+            return false;
+        }
+        
+        // Get URLs directly and purge with correct operation type
+        $urls_to_purge = $this->get_image_urls($attachment_id);
+        
+        if (empty($urls_to_purge)) {
+            $this->log_operation('media_replace_delayed', [], $attachment_id, 'info', 'No URLs found for delayed purge');
+            return false;
+        }
+        
+        $result = $this->purge_cloudflare_cache($urls_to_purge, 'media_replace_delayed', $attachment_id);
+        
+        // Show success message only if delayed purge was successful
+        if ($result) {
+            $this->add_success_notice(sprintf(
+                __('Media replacement detected: Successfully purged %d image variant(s) from Cloudflare cache.', 'cloudflare-purger'),
+                count($urls_to_purge)
+            ));
+        }
+        
+        return $result;
     }
     
     /**
@@ -926,16 +1255,29 @@ class CloudflarePurger {
         
         // Get full size image URL
         $full_url = wp_get_attachment_url($attachment_id);
+        
         if ($full_url) {
             $urls[] = $full_url;
         }
         
         // Get all image size variants
         $image_sizes = get_intermediate_image_sizes();
+        
         foreach ($image_sizes as $size) {
             $image_data = wp_get_attachment_image_src($attachment_id, $size);
             if ($image_data && $image_data[0] && $image_data[0] !== $full_url) {
                 $urls[] = $image_data[0];
+            }
+        }
+        
+        // Fallback: try to construct URLs manually if WordPress functions fail
+        if (empty($urls)) {
+            $attached_file = get_attached_file($attachment_id);
+            if ($attached_file && file_exists($attached_file)) {
+                $upload_dir = wp_upload_dir();
+                $relative_path = str_replace($upload_dir['basedir'], '', $attached_file);
+                $manual_url = $upload_dir['baseurl'] . $relative_path;
+                $urls[] = $manual_url;
             }
         }
         

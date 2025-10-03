@@ -308,6 +308,18 @@ button:disabled,
     font-style: italic;
 }
 
+.cloudflare-info .description .dashicons {
+    font-size: 14px;
+    line-height: 1;
+    vertical-align: text-top;
+}
+
+/* Auto-purge enabled indicator */
+.cloudflare-info .description[style*="color: rgb(70, 180, 80)"] {
+    font-weight: 500;
+    font-style: normal;
+}
+
 /* Not configured state styling */
 .cloudflare-not-configured {
     text-align: center;
