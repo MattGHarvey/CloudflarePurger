@@ -1015,6 +1015,7 @@ class CloudflarePurger {
     private function get_image_variant_details($attachment_id) {
         $variants = array();
         $attachment_metadata = wp_get_attachment_metadata($attachment_id);
+        $processed_urls = array(); // Track URLs to avoid duplicates
         
         // Get full size image
         $full_url = wp_get_attachment_url($attachment_id);
@@ -1026,20 +1027,45 @@ class CloudflarePurger {
                 'height' => $attachment_metadata['height'] ?? 'Unknown',
                 'filesize' => $attachment_metadata['filesize'] ?? null
             );
+            $processed_urls[] = $full_url;
         }
         
-        // Get all image size variants
+        // Method 1: Get registered image size variants
         $image_sizes = get_intermediate_image_sizes();
         foreach ($image_sizes as $size_name) {
             $image_data = wp_get_attachment_image_src($attachment_id, $size_name);
-            if ($image_data && $image_data[0] && $image_data[0] !== $full_url) {
+            if ($image_data && $image_data[0] && !in_array($image_data[0], $processed_urls)) {
                 $variants[] = array(
                     'name' => ucwords(str_replace(array('-', '_'), ' ', $size_name)),
                     'url' => $image_data[0],
                     'width' => $image_data[1] ?? 'Unknown',
                     'height' => $image_data[2] ?? 'Unknown',
-                    'filesize' => null // Not easily available for variants
+                    'filesize' => null
                 );
+                $processed_urls[] = $image_data[0];
+            }
+        }
+        
+        // Method 2: Get ALL size variants from attachment metadata (including custom sizes)
+        if (isset($attachment_metadata['sizes']) && is_array($attachment_metadata['sizes'])) {
+            $upload_dir = wp_upload_dir();
+            $base_dir = dirname(get_attached_file($attachment_id));
+            $base_url = str_replace($upload_dir['basedir'], $upload_dir['baseurl'], $base_dir);
+            
+            foreach ($attachment_metadata['sizes'] as $size_name => $size_data) {
+                if (isset($size_data['file'])) {
+                    $size_url = $base_url . '/' . $size_data['file'];
+                    if (!in_array($size_url, $processed_urls)) {
+                        $variants[] = array(
+                            'name' => ucwords(str_replace(array('-', '_'), ' ', $size_name)),
+                            'url' => $size_url,
+                            'width' => $size_data['width'] ?? 'Unknown',
+                            'height' => $size_data['height'] ?? 'Unknown',
+                            'filesize' => isset($size_data['filesize']) ? $size_data['filesize'] : null
+                        );
+                        $processed_urls[] = $size_url;
+                    }
+                }
             }
         }
         
@@ -1458,7 +1484,7 @@ class CloudflarePurger {
             $urls[] = $full_url;
         }
         
-        // Get all image size variants
+        // Method 1: Get registered image size variants
         $image_sizes = get_intermediate_image_sizes();
         
         foreach ($image_sizes as $size) {
@@ -1468,18 +1494,37 @@ class CloudflarePurger {
             }
         }
         
-        // Fallback: try to construct URLs manually if WordPress functions fail
-        if (empty($urls)) {
+        // Method 2: Get ALL size variants from attachment metadata (including custom sizes)
+        $attachment_metadata = wp_get_attachment_metadata($attachment_id);
+        if (isset($attachment_metadata['sizes']) && is_array($attachment_metadata['sizes'])) {
+            $upload_dir = wp_upload_dir();
+            $base_dir = dirname(get_attached_file($attachment_id));
+            $base_url = str_replace($upload_dir['basedir'], $upload_dir['baseurl'], $base_dir);
+            
+            foreach ($attachment_metadata['sizes'] as $size_name => $size_data) {
+                if (isset($size_data['file'])) {
+                    $size_url = $base_url . '/' . $size_data['file'];
+                    if (!in_array($size_url, $urls)) {
+                        $urls[] = $size_url;
+                    }
+                }
+            }
+        }
+        
+        // Method 3: Fallback - try to construct URLs manually if WordPress functions fail
+        if (count($urls) <= 1) { // Only full size found or nothing
             $attached_file = get_attached_file($attachment_id);
             if ($attached_file && file_exists($attached_file)) {
                 $upload_dir = wp_upload_dir();
                 $relative_path = str_replace($upload_dir['basedir'], '', $attached_file);
                 $manual_url = $upload_dir['baseurl'] . $relative_path;
-                $urls[] = $manual_url;
+                if (!in_array($manual_url, $urls)) {
+                    $urls[] = $manual_url;
+                }
             }
         }
         
-        return $urls;
+        return array_unique($urls);
     }
     
     /**
