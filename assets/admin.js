@@ -176,5 +176,4 @@ function refreshPurgeLog() {
     }
 }
 
-// Cloudflare Purger functionality is now handled inline on the attachment edit screen
-// This file focuses on the main admin pages functionality
+// Attachment edit screen functionality is handled by inline scripts in the plugin file

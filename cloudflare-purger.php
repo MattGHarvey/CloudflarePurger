@@ -83,6 +83,7 @@ class CloudflarePurger {
         add_action('wp_ajax_cloudflare_test_connection', array($this, 'ajax_test_connection'));
         add_action('wp_ajax_cloudflare_purge_post', array($this, 'ajax_purge_post'));
         add_action('wp_ajax_cloudflare_purge_media', array($this, 'ajax_purge_media'));
+        add_action('wp_ajax_cloudflare_get_image_variants', array($this, 'ajax_get_image_variants'));
 
         
         // Edit Media screen hooks
@@ -980,6 +981,72 @@ class CloudflarePurger {
     }
     
     /**
+     * AJAX handler for getting image variants
+     */
+    public function ajax_get_image_variants() {
+        // Security checks
+        if (!current_user_can('upload_files')) {
+            wp_send_json_error('Insufficient permissions');
+        }
+        
+        if (!wp_verify_nonce($_POST['nonce'] ?? '', 'cloudflare_purger_nonce')) {
+            wp_send_json_error('Invalid nonce');
+        }
+        
+        $attachment_id = intval($_POST['attachment_id'] ?? 0);
+        
+        if (!$attachment_id || !wp_attachment_is_image($attachment_id)) {
+            wp_send_json_error('Invalid attachment ID or not an image');
+        }
+        
+        // Get all image URLs and their details
+        $variants = $this->get_image_variant_details($attachment_id);
+        
+        if (empty($variants)) {
+            wp_send_json_error('No image variants found');
+        }
+        
+        wp_send_json_success($variants);
+    }
+    
+    /**
+     * Get detailed information about image variants
+     */
+    private function get_image_variant_details($attachment_id) {
+        $variants = array();
+        $attachment_metadata = wp_get_attachment_metadata($attachment_id);
+        
+        // Get full size image
+        $full_url = wp_get_attachment_url($attachment_id);
+        if ($full_url) {
+            $variants[] = array(
+                'name' => 'Full Size',
+                'url' => $full_url,
+                'width' => $attachment_metadata['width'] ?? 'Unknown',
+                'height' => $attachment_metadata['height'] ?? 'Unknown',
+                'filesize' => $attachment_metadata['filesize'] ?? null
+            );
+        }
+        
+        // Get all image size variants
+        $image_sizes = get_intermediate_image_sizes();
+        foreach ($image_sizes as $size_name) {
+            $image_data = wp_get_attachment_image_src($attachment_id, $size_name);
+            if ($image_data && $image_data[0] && $image_data[0] !== $full_url) {
+                $variants[] = array(
+                    'name' => ucwords(str_replace(array('-', '_'), ' ', $size_name)),
+                    'url' => $image_data[0],
+                    'width' => $image_data[1] ?? 'Unknown',
+                    'height' => $image_data[2] ?? 'Unknown',
+                    'filesize' => null // Not easily available for variants
+                );
+            }
+        }
+        
+        return $variants;
+    }
+    
+    /**
      * Add Cloudflare Cache meta box to attachment edit screen
      */
     public function add_attachment_meta_box() {
@@ -1013,6 +1080,13 @@ class CloudflarePurger {
                     <button type="button" class="button button-primary cloudflare-purge-attachment" data-attachment-id="<?php echo esc_attr($post->ID); ?>">
                         <span class="dashicons dashicons-update" style="font-size: 16px; line-height: 1.2; margin-right: 5px;"></span>
                         <?php _e('Purge Cache', 'cloudflare-purger'); ?>
+                    </button>
+                </p>
+                
+                <p style="margin-top: 10px;">
+                    <button type="button" class="button cloudflare-show-variants" data-attachment-id="<?php echo esc_attr($post->ID); ?>" style="width: 100%;">
+                        <span class="dashicons dashicons-visibility" style="font-size: 14px; margin-right: 5px;"></span>
+                        <?php _e('View Image Variants', 'cloudflare-purger'); ?>
                     </button>
                 </p>
                 
@@ -1145,6 +1219,130 @@ class CloudflarePurger {
                         }
                     });
                 });
+                
+                // Handle View Image Variants button
+                $(document).on('click', '.cloudflare-show-variants', function(e) {
+                    e.preventDefault();
+                    
+                    var button = $(this);
+                    var attachmentId = button.data('attachment-id');
+                    var originalHtml = button.html();
+                    
+                    // Prevent multiple clicks
+                    if (button.hasClass('loading-variants')) {
+                        return;
+                    }
+                    
+                    // Update button state
+                    button.addClass('loading-variants').prop('disabled', true);
+                    button.html('<span class="dashicons dashicons-update"></span> Loading...');
+                    
+                    $.ajax({
+                        url: cloudflare_purger_ajax.ajax_url,
+                        type: 'POST',
+                        data: {
+                            action: 'cloudflare_get_image_variants',
+                            attachment_id: attachmentId,
+                            nonce: cloudflare_purger_ajax.nonce
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                showVariantsModal(response.data);
+                            } else {
+                                alert('Error loading variants: ' + (response.data || 'Unknown error'));
+                            }
+                        },
+                        error: function(xhr, status, error) {
+                            alert('An error occurred while loading image variants. Please try again.');
+                        },
+                        complete: function() {
+                            button.removeClass('loading-variants').prop('disabled', false);
+                            button.html(originalHtml);
+                        }
+                    });
+                });
+                
+                // Function to show the variants modal
+                function showVariantsModal(variants) {
+                    // Create modal HTML
+                    var modalHtml = '<div id="cloudflare-variants-modal" class="cloudflare-modal" style="display: block; position: fixed; z-index: 999999; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); opacity: 0; transition: opacity 0.3s ease;">' +
+                                   '<div class="cloudflare-modal-content" style="background-color: white; margin: 5% auto; padding: 0; border: 1px solid #ddd; width: 90%; max-width: 900px; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); transform: translateY(-50px); transition: transform 0.3s ease;">' +
+                                   '<div class="cloudflare-modal-header" style="padding: 20px; background-color: #f8f9fa; border-bottom: 1px solid #ddd; border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; align-items: center;">' +
+                                   '<h3 style="margin: 0; color: #1d2327; font-size: 18px;">Image Variants <span style="color: #666; font-weight: normal; font-size: 14px;">(' + variants.length + ' found)</span></h3>' +
+                                   '<span class="cloudflare-modal-close" style="font-size: 24px; font-weight: bold; cursor: pointer; color: #666; padding: 5px; line-height: 1; transition: color 0.2s ease;">&times;</span>' +
+                                   '</div>' +
+                                   '<div class="cloudflare-modal-body" style="padding: 20px; max-height: 500px; overflow-y: auto;">' +
+                                   '<table class="cloudflare-variants-table" style="width: 100%; border-collapse: collapse; font-size: 14px;">' +
+                                   '<thead>' +
+                                   '<tr style="background-color: #f8f9fa;">' +
+                                   '<th style="padding: 12px; border-bottom: 2px solid #ddd; text-align: center; font-weight: 600; color: #1d2327; width: 100px;">Preview</th>' +
+                                   '<th style="padding: 12px; border-bottom: 2px solid #ddd; text-align: left; font-weight: 600; color: #1d2327;">Size Name</th>' +
+                                   '<th style="padding: 12px; border-bottom: 2px solid #ddd; text-align: left; font-weight: 600; color: #1d2327;">Dimensions</th>' +
+                                   '<th style="padding: 12px; border-bottom: 2px solid #ddd; text-align: left; font-weight: 600; color: #1d2327;">URL</th>' +
+                                   '</tr>' +
+                                   '</thead>' +
+                                   '<tbody>';
+                    
+                    // Add each variant to the table
+                    variants.forEach(function(variant, index) {
+                        var dimensions = variant.width + ' × ' + variant.height;
+                        var rowColor = index % 2 === 0 ? '#ffffff' : '#f8f9fa';
+                        
+                        // Create thumbnail with max dimensions
+                        var thumbnailStyle = 'max-width: 80px; max-height: 60px; width: auto; height: auto; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); cursor: pointer;';
+                        
+                        modalHtml += '<tr style="background-color: ' + rowColor + '; transition: background-color 0.2s ease;" onmouseover="this.style.backgroundColor=\'#e3f2fd\'" onmouseout="this.style.backgroundColor=\'' + rowColor + '\'">' +
+                                    '<td style="padding: 10px; border-bottom: 1px solid #e0e0e0; text-align: center;"><img src="' + variant.url + '" style="' + thumbnailStyle + '" alt="' + variant.name + '" title="Click to view full size" onclick="window.open(\'' + variant.url + '\', \'_blank\')"></td>' +
+                                    '<td style="padding: 10px; border-bottom: 1px solid #e0e0e0; font-weight: 500;">' + variant.name + '</td>' +
+                                    '<td style="padding: 10px; border-bottom: 1px solid #e0e0e0; color: #666;">' + dimensions + '</td>' +
+                                    '<td style="padding: 10px; border-bottom: 1px solid #e0e0e0;"><a href="' + variant.url + '" target="_blank" style="color: #0073aa; text-decoration: none; word-break: break-all;" title="' + variant.url + '">' + 
+                                    variant.url.split('/').pop() + '</a></td>' +
+                                    '</tr>';
+                    });
+                    
+                    modalHtml += '</tbody>' +
+                                '</table>' +
+                                '</div>' +
+                                '</div>' +
+                                '</div>';
+                    
+                    // Add modal to page
+                    $('body').append(modalHtml);
+                    
+                    // Trigger animation
+                    setTimeout(function() {
+                        $('#cloudflare-variants-modal').css('opacity', '1');
+                        $('#cloudflare-variants-modal .cloudflare-modal-content').css('transform', 'translateY(0)');
+                    }, 10);
+                    
+                    // Function to close modal with animation
+                    function closeModal() {
+                        var modal = $('#cloudflare-variants-modal');
+                        modal.css('opacity', '0');
+                        modal.find('.cloudflare-modal-content').css('transform', 'translateY(-50px)');
+                        setTimeout(function() {
+                            modal.remove();
+                        }, 300);
+                        $(document).off('keydown.cloudflare-modal');
+                    }
+                    
+                    // Handle close button
+                    $('.cloudflare-modal-close').click(closeModal);
+                    
+                    // Handle click outside modal to close
+                    $('#cloudflare-variants-modal').click(function(e) {
+                        if (e.target.id === 'cloudflare-variants-modal') {
+                            closeModal();
+                        }
+                    });
+                    
+                    // Handle escape key to close
+                    $(document).on('keydown.cloudflare-modal', function(e) {
+                        if (e.keyCode === 27) { // Escape key
+                            closeModal();
+                        }
+                    });
+                }
             }
         });
         </script>
